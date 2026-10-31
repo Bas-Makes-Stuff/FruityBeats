@@ -61,12 +61,49 @@ jobs:
           <key>com.apple.security.cs.allow-jit</key><true/>
           </dict></plist>
           PLIST
+          # Keep managed assemblies and runtime data in Resources, not in the
+          # executable-only MacOS directory where strict signing treats them as code.
+          resources="$app/Contents/Resources"
+          for entry in "$app/Contents/MacOS/"*; do
+            mv "$entry" "$resources/"
+          done
+          cat > Launcher.c <<'C'
+          #include <mach-o/dyld.h>
+          #include <limits.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          int main(int argc, char **argv) {
+              char executable[4096], resolved[4096], runtime[4096];
+              uint32_t capacity = sizeof(executable);
+              if (_NSGetExecutablePath(executable, &capacity) != 0 ||
+                  realpath(executable, resolved) == NULL) {
+                  perror("FruityBeats executable path");
+                  return 126;
+              }
+              char *last = strrchr(resolved, '/');
+              if (!last) return 126;
+              *last = 0;
+              last = strrchr(resolved, '/');
+              if (!last) return 126;
+              *last = 0;
+              int written = snprintf(runtime, sizeof(runtime), "%s/Resources/FruityBeats", resolved);
+              if (written < 0 || written >= sizeof(runtime)) return 126;
+              argv[0] = runtime;
+              execv(runtime, argv);
+              perror("FruityBeats bundled runtime");
+              return 127;
+          }
+          C
+          clang -arch arm64 -mmacosx-version-min=15.0 -Os Launcher.c -o "$app/Contents/MacOS/FruityBeats"
           while IFS= read -r -d '' binary; do
             case "$(file -b "$binary")" in
-              *Mach-O*) codesign --force --sign - --timestamp=none "$binary" ;;
+              *Mach-O*) chmod 755 "$binary"; if [[ "$binary" == "$resources/FruityBeats" ]]; then codesign --force --sign - --timestamp=none --entitlements Entitlements.plist "$binary"; else codesign --force --sign - --timestamp=none "$binary"; fi ;;
             esac
-          done < <(find "$app/Contents/MacOS" -type f -print0)
-          codesign --force --sign - --timestamp=none --entitlements Entitlements.plist "$app"
+          done < <(find "$app/Contents" -type f -print0)
+          codesign --force --sign - --timestamp=none "$app"
           codesign --verify --deep --strict --verbose=4 "$app" 2>&1 | tee -a "$report"
           codesign --display --verbose=4 "$app" 2>&1 | tee -a "$report"
           test "$(lipo -archs "$app/Contents/MacOS/FruityBeats")" = arm64
