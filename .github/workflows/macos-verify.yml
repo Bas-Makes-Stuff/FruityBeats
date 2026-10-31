@@ -1,0 +1,138 @@
+name: Verify standalone Apple Silicon app
+
+on:
+  push:
+    paths:
+      - '.github/workflows/macos-verify.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mac-bundle:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Confirm native Apple Silicon runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sw_vers
+          command -v codesign
+
+      - name: Download and verify the published inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 -o input-mac.zip https://github.com/Bas-Makes-Stuff/FruityBeats/releases/download/v1.5.0-preview.2/FruityBeats-macOS.app.zip
+          curl --fail --location --retry 3 -o FruityBeats-Windows.zip https://github.com/Bas-Makes-Stuff/FruityBeats/releases/download/v1.5.0-preview.2/FruityBeats-Windows.zip
+          echo '21bf10ae0045f92d7de18aad719cb01a126bc526593a49d069ce2ffd33f12396  input-mac.zip' | shasum -a 256 -c -
+          echo '39d6d772c530c88124b12c55cb3e55cda5a979976a45b2bdd8baea085d3a5898  FruityBeats-Windows.zip' | shasum -a 256 -c -
+          mkdir stage
+          ditto -x -k input-mac.zip stage
+          test -x stage/FruityBeats.app/Contents/MacOS/FruityBeats
+          test -f stage/FruityBeats.app/Contents/MacOS/libcoreclr.dylib
+          test -f stage/FruityBeats.app/Contents/MacOS/libhostfxr.dylib
+          test "$(find stage/Sounds -type f -name '*.wav' | wc -l | tr -d ' ')" = 347
+
+      - name: Diagnose and seal the complete application bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          app="$RUNNER_TEMP/stage/FruityBeats.app"
+          report="$RUNNER_TEMP/MAC-VERIFICATION.txt"
+          {
+            echo 'FruityBeats Apple Silicon packaging verification'
+            date -u
+            uname -m
+            sw_vers
+            echo 'Original bundle signature diagnostic:'
+            codesign --verify --deep --strict --verbose=4 "$app" 2>&1 || true
+          } > "$report"
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 1.5.3' "$app/Contents/Info.plist"
+          cat > Entitlements.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>com.apple.security.cs.allow-jit</key><true/>
+          </dict></plist>
+          PLIST
+          while IFS= read -r -d '' binary; do
+            case "$(file -b "$binary")" in
+              *Mach-O*) codesign --force --sign - --timestamp=none "$binary" ;;
+            esac
+          done < <(find "$app/Contents/MacOS" -type f -print0)
+          codesign --force --sign - --timestamp=none --entitlements Entitlements.plist "$app"
+          codesign --verify --deep --strict --verbose=4 "$app" 2>&1 | tee -a "$report"
+          codesign --display --verbose=4 "$app" 2>&1 | tee -a "$report"
+          test "$(lipo -archs "$app/Contents/MacOS/FruityBeats")" = arm64
+          echo 'PASS Native arm64 app host, bundled runtime, and complete ad-hoc bundle signature.' >> "$report"
+          echo 'Ad-hoc signing supplies bundle integrity, not Apple Developer ID or notarization.' >> "$report"
+          if spctl --assess --type execute --verbose=4 "$app" >> "$report" 2>&1; then
+            echo 'Gatekeeper assessment accepted.' >> "$report"
+          else
+            echo 'Gatekeeper assessment does not accept this development identity; Developer ID/notarization are not supplied.' >> "$report"
+          fi
+          cat > stage/README.md <<'README'
+          # FruityBeats Apple Silicon development preview 3
+          This self-contained app includes its .NET runtime and 347 synthesis presets.
+          The Sounds folder beside the app contains 347 categorized original WAV files.
+          The app is packaged and ad-hoc signed on an Apple Silicon Mac runner.
+          See MAC-VERIFICATION.txt for the actual checks and platform results.
+          Ad-hoc signing verifies integrity; it is not Developer ID signing or notarization.
+          Full Windows/Mac feature parity and physical audio/MIDI acceptance remain incomplete.
+          README
+          ditto -c -k --sequesterRsrc stage FruityBeats-macOS.app.zip
+          mkdir roundtrip
+          ditto -x -k FruityBeats-macOS.app.zip roundtrip
+          codesign --verify --deep --strict --verbose=4 roundtrip/FruityBeats.app 2>&1 | tee -a "$report"
+          echo 'PASS Signature and executable permissions survive extraction of the exact ZIP.' >> "$report"
+
+      - name: Run the packaged engine without an external .NET installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          executable="$RUNNER_TEMP/roundtrip/FruityBeats.app/Contents/MacOS/FruityBeats"
+          DOTNET_ROOT="$RUNNER_TEMP/no-external-dotnet" DOTNET_ROOT_ARM64="$RUNNER_TEMP/no-external-dotnet" "$executable" --self-test 2>&1 | tee engine-checks.txt
+          echo 'PASS Packaged native engine self-tests completed on Apple Silicon with the bundled runtime.' >> MAC-VERIFICATION.txt
+          cat engine-checks.txt >> MAC-VERIFICATION.txt
+          codesign --verify --deep --strict --verbose=4 roundtrip/FruityBeats.app 2>&1 | tee -a MAC-VERIFICATION.txt
+
+      - name: Check native GUI process launch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          executable="$RUNNER_TEMP/roundtrip/FruityBeats.app/Contents/MacOS/FruityBeats"
+          "$executable" > gui-launch.txt 2>&1 &
+          app_pid=$!
+          sleep 10
+          if kill -0 "$app_pid" 2>/dev/null; then
+            echo 'PASS Native GUI process remained alive for 10 seconds. This does not certify audio hardware, dialogs or user interaction.' >> MAC-VERIFICATION.txt
+            kill -TERM "$app_pid"
+            wait "$app_pid" || true
+          else
+            cat gui-launch.txt
+            echo 'FAIL Native GUI process exited before the launch check.' >> MAC-VERIFICATION.txt
+            exit 1
+          fi
+          cat gui-launch.txt >> MAC-VERIFICATION.txt
+          codesign --verify --deep --strict --verbose=4 roundtrip/FruityBeats.app 2>&1 | tee -a MAC-VERIFICATION.txt
+
+      - name: Upload test package and verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FruityBeats-macOS-verification
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/FruityBeats-macOS.app.zip
+            ${{ runner.temp }}/MAC-VERIFICATION.txt
+            ${{ runner.temp }}/engine-checks.txt
+            ${{ runner.temp }}/gui-launch.txt
